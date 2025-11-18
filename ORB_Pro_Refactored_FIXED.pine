@@ -1,0 +1,455 @@
+//@version=5
+strategy("ORB Pro",
+     overlay=true, initial_capital=50000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     calc_on_every_tick=false,
+     calc_on_order_fills=true, process_orders_on_close=false)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CONSTANTS - Centralized magic numbers and strings
+// ══════════════════════════════════════════════════════════════════════════════
+const string ALERT_ID = "TV_N8N_2f6e9b3c"
+const int SECOND_CANDLE_LOOKBACK = 2
+const int PERCENT_TO_DECIMAL = 100
+
+// Alert messages
+MSG_LONG_ENTRY   = "BUY: ORB signal " + ALERT_ID
+MSG_SHORT_ENTRY  = "SELL: ORB signal " + ALERT_ID
+MSG_TP1_LONG     = "TP1 LONG filled " + ALERT_ID
+MSG_TP1_SHORT    = "TP1 SHORT filled " + ALERT_ID
+MSG_RUNNER_SL    = "Runner SL filled " + ALERT_ID
+MSG_FULL_TP      = "FULL TP filled " + ALERT_ID
+MSG_FULL_SL      = "FULL SL filled " + ALERT_ID
+MSG_VWAP_EXIT    = "EXIT: VWAP invalidation " + ALERT_ID
+MSG_BREAKEVEN    = "BREAKEVEN TRIGGERED " + ALERT_ID
+MSG_FLAT_4PM     = "Exit all positions at or after 4:00pm New York time"
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS - Organized by category
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Opening Range & Sessions
+orSession        = input.session("0930-0945", "Opening Range Window", group="Opening Range & Sessions")
+orTz             = input.string("America/New_York", "OR Timezone", group="Opening Range & Sessions",
+                   options=["America/New_York","UTC","America/Chicago","America/Denver","America/Los_Angeles"])
+useTimeFilter    = input.bool(true, "Enable Trading Window(s)", group="Opening Range & Sessions")
+amSess           = input.session("0930-1145", "AM Session", group="Opening Range & Sessions")
+usePmSess        = input.bool(false, "Enable PM Session", group="Opening Range & Sessions")
+pmSess           = input.session("1430-1545", "PM Session", group="Opening Range & Sessions")
+sessTz           = input.string("America/New_York", "Session Timezone", group="Opening Range & Sessions",
+                   options=["America/New_York","UTC","America/Chicago","America/Denver","America/Los_Angeles"])
+
+// Confirmations
+useVWAP          = input.bool(true, "Require VWAP Confirmation", group="Confirmations")
+buffTicks        = input.int(2, "Breakout Buffer (ticks)", minval=0, group="Confirmations")
+useEMA           = input.bool(true, "Enable EMA Filter", group="Confirmations")
+emaLen           = input.int(34, "EMA Length", minval=1, group="Confirmations")
+useSecondCandle  = input.bool(true, "Require 2nd-Candle Confirmation", group="Confirmations")
+
+// HTF Trend Filter
+useHTFTrend      = input.bool(true, "Enable HTF Trend Filter", group="HTF Trend Filter")
+htfTimeframe     = input.timeframe("30", "HTF Timeframe", group="HTF Trend Filter")
+htfEmaLen        = input.int(100, "HTF EMA Length", minval=1, group="HTF Trend Filter")
+requireHTFClosed = input.bool(true, "Only trade when HTF bar is CLOSED", group="HTF Trend Filter")
+
+// ATR / Volatility Filters
+useATRFilter     = input.bool(true, "Enable Min OR vs ATR", group="ATR / Volatility Filters")
+atrLen           = input.int(14, "ATR Length", minval=1, group="ATR / Volatility Filters")
+atrMinFrac       = input.float(0.5, "Min OR Width = ATR ×", minval=0.1, step=0.1, group="ATR / Volatility Filters")
+useATRMax        = input.bool(true, "Skip if OR too wide", group="ATR / Volatility Filters")
+atrMaxFrac       = input.float(1.5, "Max OR Width = ATR ×", minval=0.5, step=0.1, group="ATR / Volatility Filters")
+useLowVolSkip    = input.bool(false, "Skip if Today ATR < Yesterday ATR × K", group="ATR / Volatility Filters")
+lowVolK          = input.float(0.7, "Low Vol K", minval=0.1, step=0.05, group="ATR / Volatility Filters")
+
+// VWAP Slope
+useVwapSlope     = input.bool(false, "Require VWAP Slope (anti-chop)", group="VWAP Slope")
+vwapSlopeLen     = input.int(20, "Slope Lookback (bars)", minval=1, group="VWAP Slope")
+vwapSlopePctMin  = input.float(0.02, "Min |Slope| (% of price)", step=0.005, group="VWAP Slope")
+
+// Daily Context Filters
+useInsideDaySkip = input.bool(false, "Skip Inside Day (vs prior day)", group="Daily Context Filters")
+
+// Stops / Targets / Partials
+tpPctInput       = input.float(100, "Base TP % of OR", minval=1, step=1, group="Stops / Targets / Partials")
+slPctInput       = input.float(50, "Base SL % of OR", minval=0.1, step=0.1, group="Stops / Targets / Partials")
+usePartials      = input.bool(true, "Use Partial Take Profit + Runner", group="Stops / Targets / Partials")
+tp1_R            = input.float(1.0, "TP1 at R-multiple", step=0.25, group="Stops / Targets / Partials")
+tp1_qty_pct      = input.int(50, "TP1 Qty %", minval=1, maxval=99, group="Stops / Targets / Partials")
+runnerTrailATR   = input.float(1.5, "Runner ATR Trail (× ATR)", step=0.1, group="Stops / Targets / Partials")
+trailActivate_R  = input.float(0.75, "Activate Runner Trail at R", step=0.25, group="Stops / Targets / Partials")
+
+// Breakeven / Risk Caps
+useBreakeven     = input.bool(true, "Enable Breakeven Stop (one-time)", group="Breakeven / Risk Caps")
+bePctInput       = input.float(75, "BE Trigger % of OR", minval=1, step=1, group="Breakeven / Risk Caps")
+maxLossDollars   = input.float(0, "Max Loss per Trade ($)", minval=0, step=1, group="Breakeven / Risk Caps")
+
+// Misc
+enableAlerts     = input.bool(true, "Enable Alerts", group="Misc")
+
+// Backtest range: allow auto last-N-days (default) or manual start/end
+backtestAuto     = input.bool(true, "Auto backtest last N days", group="Backtest")
+backtestDays     = input.int(30, "Backtest Days (N)", minval=1, group="Backtest")
+backtestStart    = input.time(timestamp("2020-01-01T00:00"), "Backtest Start (manual)", group="Backtest")
+backtestEnd      = input.time(timestamp("2030-12-31T23:59"), "Backtest End (manual)", group="Backtest")
+
+// Convert percentages to decimals
+buff          = buffTicks * syminfo.mintick
+useBuffer     = buffTicks > 0
+tpPct         = tpPctInput / PERCENT_TO_DECIMAL
+slPct         = slPctInput / PERCENT_TO_DECIMAL
+bePctOfOR     = bePctInput / PERCENT_TO_DECIMAL
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS - Reduce code duplication
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Calculate stop loss with max loss override
+calcStopLoss(float rawStop, float entryPrice, bool isLong) =>
+    if maxLossDollars <= 0
+        rawStop
+    else
+        maxLossPts = maxLossDollars / syminfo.pointvalue
+        riskPts = isLong ? (entryPrice - rawStop) : (rawStop - entryPrice)
+        if riskPts > maxLossPts
+            isLong ? (entryPrice - maxLossPts) : (entryPrice + maxLossPts)
+        else
+            rawStop
+
+// Check if entry price is valid (not beyond TP or past SL)
+isEntryValid(float entryPrice, float tpLevel, float slLevel, bool isLong) =>
+    tpOk = na(tpLevel) or (isLong ? entryPrice < tpLevel : entryPrice > tpLevel)
+    slOk = na(slLevel) or (isLong ? entryPrice > slLevel : entryPrice < slLevel)
+    tpOk and slOk
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// OPENING RANGE & SESSIONS
+// ══════════════════════════════════════════════════════════════════════════════
+inOr    = not na(time(timeframe.period, orSession, orTz))
+orStart = inOr and not inOr[1]
+
+var float orHigh = na
+var float orLow  = na
+
+if orStart
+    orHigh := high
+    orLow  := low
+else if inOr
+    orHigh := math.max(orHigh, high)
+    orLow  := math.min(orLow, low)
+
+orMid   = (orHigh + orLow) / 2
+orWidth = orHigh - orLow
+haveOR  = not na(orHigh) and not na(orLow) and orWidth > 0
+R       = haveOR ? math.max(orWidth, syminfo.mintick) : na  // R = effective OR width
+
+// Session windows
+inAM     = not useTimeFilter or not na(time(timeframe.period, amSess, sessTz))
+inPM     = usePmSess and not na(time(timeframe.period, pmSess, sessTz))
+inWindow = (not useTimeFilter) or inAM or inPM
+
+// Backtest effective start/end (ms). If `backtestAuto` is true, default to last `backtestDays` days.
+msPerDay = 24 * 60 * 60 * 1000
+endEffective = backtestAuto ? time : backtestEnd
+startEffective = backtestAuto ? time - backtestDays * msPerDay : backtestStart
+inBacktestRange = time >= startEffective and time <= endEffective
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INDICATORS
+// ══════════════════════════════════════════════════════════════════════════════
+vwap = ta.vwap(hlc3)
+ema  = ta.ema(close, emaLen)
+atr  = ta.atr(atrLen)
+
+// HTF indicators (consolidated requests)
+[htfEMA, htfClosed] = request.security(syminfo.tickerid, htfTimeframe,[ta.ema(close, htfEmaLen), barstate.isconfirmed], barmerge.gaps_off, barmerge.lookahead_off)
+
+// Daily data (consolidated requests)
+[dailyHigh_prev, dailyLow_prev, dailyATR_curr, dailyATR_prev] = request.security(syminfo.tickerid, "D", [high[1], low[1], ta.atr(14), ta.atr(14)[1]], barmerge.gaps_off, barmerge.lookahead_off)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FILTER CONDITIONS - Named booleans for clarity
+// ══════════════════════════════════════════════════════════════════════════════
+
+// VWAP Slope filter
+vwapSlopeOk = true
+if useVwapSlope
+    vwapSlope = vwap - nz(vwap[vwapSlopeLen])
+    vwapSlopePct = math.abs(vwapSlope) / close * PERCENT_TO_DECIMAL
+    vwapSlopeOk := vwapSlopePct >= vwapSlopePctMin
+
+// Inside day filter
+insideDayOk = true
+if useInsideDaySkip and haveOR
+    isInside = (orHigh < dailyHigh_prev) and (orLow > dailyLow_prev)
+    insideDayOk := not isInside
+
+// Low volatility filter
+lowVolOk = not useLowVolSkip or dailyATR_curr >= dailyATR_prev * lowVolK
+
+// OR width validation
+orWidthOk = true
+if useATRFilter
+    orWidthOk := orWidth >= atr * atrMinFrac
+if useATRMax
+    orWidthOk := orWidthOk and orWidth <= atr * atrMaxFrac
+
+validOR = haveOR and orWidthOk
+
+// HTF trend gate
+htfGate    = not useHTFTrend or (not requireHTFClosed or htfClosed)
+htfLongOk  = not useHTFTrend or (htfGate and close > htfEMA)
+htfShortOk = not useHTFTrend or (htfGate and close < htfEMA)
+
+// Build common filter set for long/short to reduce duplication
+filterParams(bool isLong) =>
+    htfOk = isLong ? htfLongOk : htfShortOk
+    vwapOk = not useVWAP or (isLong ? close > vwap : close < vwap)
+    bufferOk = not useBuffer or (isLong ? close > orHigh + buff : close < orLow - buff)
+    emaOk = not useEMA or (isLong ? close > ema : close < ema)
+    htfOk and vwapOk and bufferOk and emaOk
+
+// Simplified second-candle confirmation with clear guards
+secondCandleOk(bool isLong) =>
+    if not useSecondCandle
+        true
+    else if bar_index <= SECOND_CANDLE_LOOKBACK
+        false
+    else
+        // require OR existed on previous bars and the immediate prior bar is the confirming candle
+        prevExists = haveOR[1] and haveOR[2]
+        if not prevExists or inOr[1]
+            false
+        else
+            isLong ? (close[1] > orHigh[1] and close[2] <= orHigh[2]) : (close[1] < orLow[1] and close[2] >= orLow[2])
+
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STOP LOSS & TAKE PROFIT LEVELS
+// ══════════════════════════════════════════════════════════════════════════════
+var float tpLong  = na
+var float tpShort = na
+var float slLong  = na
+var float slShort = na
+
+if orStart
+    tpLong  := na
+    tpShort := na
+    slLong  := na
+    slShort := na
+
+if haveOR
+    // Base TP/SL levels
+    tpLong_raw  = orHigh + R * tpPct
+    tpShort_raw = orLow  - R * tpPct
+    slLong_raw  = orHigh - R * slPct
+    slShort_raw = orLow  + R * slPct
+    
+    // Store base levels (max loss will be applied in exit orders if needed)
+    tpLong  := tpLong_raw
+    tpShort := tpShort_raw
+    slLong  := slLong_raw
+    slShort := slShort_raw
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BREAKOUT CONDITIONS
+// ══════════════════════════════════════════════════════════════════════════════
+longBreakout  = haveOR and not inOr and high > orHigh
+shortBreakout = haveOR and not inOr and low < orLow
+
+// Second-candle confirmation implemented via centralized helper `secondCandleOk` above
+
+// Entry validity
+entryValidLong  = isEntryValid(close, tpLong, slLong, true)
+entryValidShort = isEntryValid(close, tpShort, slShort, false)
+
+// Directional filters (use centralized helper)
+longFiltersOk = filterParams(true)
+shortFiltersOk = filterParams(false)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FINAL SIGNALS
+// ══════════════════════════════════════════════════════════════════════════════
+longSignal = longBreakout and validOR and longFiltersOk and vwapSlopeOk and
+             inWindow and inBacktestRange and secondCandleOk(true) and entryValidLong and 
+             insideDayOk and lowVolOk
+
+shortSignal = shortBreakout and validOR and shortFiltersOk and vwapSlopeOk and
+              inWindow and inBacktestRange and secondCandleOk(false) and entryValidShort and 
+              insideDayOk and lowVolOk
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ENTRIES
+// ══════════════════════════════════════════════════════════════════════════════
+if longSignal and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long, alert_message=MSG_LONG_ENTRY)
+
+if shortSignal and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short, alert_message=MSG_SHORT_ENTRY)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BREAKEVEN MANAGEMENT
+// ══════════════════════════════════════════════════════════════════════════════
+var bool beTriggered = false
+
+if strategy.position_size == 0
+    beTriggered := false
+
+beDist = haveOR ? R * bePctOfOR : na
+
+longBeHit  = useBreakeven and not beTriggered and strategy.position_size > 0 and 
+             not na(beDist) and high >= strategy.position_avg_price + beDist
+shortBeHit = useBreakeven and not beTriggered and strategy.position_size < 0 and 
+             not na(beDist) and low <= strategy.position_avg_price - beDist
+
+if longBeHit or shortBeHit
+    beTriggered := true
+    if enableAlerts
+        alert(MSG_BREAKEVEN, alert.freq_once_per_bar_close)
+
+// Active stops (BE or original, with max loss applied if configured)
+activeLongStop  = beTriggered and strategy.position_size > 0 ? 
+                  strategy.position_avg_price : 
+                  calcStopLoss(slLong, strategy.position_avg_price, true)
+
+activeShortStop = beTriggered and strategy.position_size < 0 ? 
+                  strategy.position_avg_price : 
+                  calcStopLoss(slShort, strategy.position_avg_price, false)
+
+// Use appropriate stop based on position status
+beStopLong  = strategy.position_size > 0 ? activeLongStop : slLong
+beStopShort = strategy.position_size < 0 ? activeShortStop : slShort
+
+// Build exit params for DRY exit placement
+// (Exit helpers are defined later, after BE and trail calculations)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// EXITS - Fixed trailing stop implementation
+// ══════════════════════════════════════════════════════════════════════════════
+trailOffset = atr * runnerTrailATR
+
+// Runner activation
+longTrailActive  = strategy.position_size > 0 and haveOR and 
+                   high >= strategy.position_avg_price + trailActivate_R * R
+shortTrailActive = strategy.position_size < 0 and haveOR and 
+                   low <= strategy.position_avg_price - trailActivate_R * R
+
+// Partial TP levels
+longTp1  = haveOR ? strategy.position_avg_price + tp1_R * R : na
+shortTp1 = haveOR ? strategy.position_avg_price - tp1_R * R : na
+
+// Build exit params for DRY exit placement (defined after BE and trail vars)
+buildExitParams(bool isLong) =>
+    baseTP = isLong ? tpLong : tpShort
+    baseSL = isLong ? slLong : slShort
+    beStop = isLong ? beStopLong : beStopShort
+    tp1 = isLong ? longTp1 : shortTp1
+    runnerActive = isLong ? longTrailActive : shortTrailActive
+    [baseTP, baseSL, beStop, tp1, runnerActive]
+
+// Place exits for a given entry id and side
+placeExitsFor(string entryId, bool isLong) =>
+    [baseTP, baseSL, beStop, tp1, runnerActive] = buildExitParams(isLong)
+    if usePartials
+        if isLong
+            strategy.exit(entryId + "-TP1", entryId, limit=tp1, stop=beStop,
+                          qty_percent=tp1_qty_pct, comment="TP1/SL", alert_message=MSG_TP1_LONG)
+            if runnerActive
+                strategy.exit(entryId + "-Run", entryId, trail_price=beStop, trail_offset=trailOffset,
+                              qty_percent=100 - tp1_qty_pct, comment="Trail SL", alert_message=MSG_RUNNER_SL)
+            else
+                strategy.exit(entryId + "-Run", entryId, stop=beStop,
+                              qty_percent=100 - tp1_qty_pct, comment="SL", alert_message=MSG_RUNNER_SL)
+        else
+            strategy.exit(entryId + "-TP1", entryId, limit=tp1, stop=beStop,
+                          qty_percent=tp1_qty_pct, comment="TP1/SL", alert_message=MSG_TP1_SHORT)
+            if runnerActive
+                strategy.exit(entryId + "-Run", entryId, trail_price=beStop, trail_offset=trailOffset,
+                              qty_percent=100 - tp1_qty_pct, comment="Trail SL", alert_message=MSG_RUNNER_SL)
+            else
+                strategy.exit(entryId + "-Run", entryId, stop=beStop,
+                              qty_percent=100 - tp1_qty_pct, comment="SL", alert_message=MSG_RUNNER_SL)
+    else
+        strategy.exit(entryId + "-Exit", entryId, limit=baseTP, stop=(useBreakeven ? beStop : baseSL),
+                      comment="TP/SL", alert_message=MSG_FULL_TP)
+// Place exits based on position (use centralized helper)
+if strategy.position_size > 0
+    placeExitsFor("Long", true)
+else if strategy.position_size < 0
+    placeExitsFor("Short", false)
+
+// If user provided a manual end date, force-close positions once we're past it
+if not backtestAuto and time > endEffective and strategy.position_size != 0
+    strategy.close_all(comment="Backtest range end")
+
+// VWAP invalidation
+longInvalidVWAP  = useVWAP and strategy.position_size > 0 and ta.crossunder(close, vwap)
+shortInvalidVWAP = useVWAP and strategy.position_size < 0 and ta.crossover(close, vwap)
+
+if longInvalidVWAP
+    strategy.close("Long", comment="VWAP Invalidate", alert_message=MSG_VWAP_EXIT)
+    if enableAlerts
+        alert(MSG_VWAP_EXIT, alert.freq_once_per_bar_close)
+
+if shortInvalidVWAP
+    strategy.close("Short", comment="VWAP Invalidate", alert_message=MSG_VWAP_EXIT)
+    if enableAlerts
+        alert(MSG_VWAP_EXIT, alert.freq_once_per_bar_close)
+
+alertcondition(longInvalidVWAP or shortInvalidVWAP, title="VWAP Invalidate", message=MSG_VWAP_EXIT)
+
+// Daily 4pm flat
+after4pmNY = not na(time(timeframe.period, "1600-2359", "America/New_York"))
+flat4pm    = strategy.position_size != 0 and after4pmNY
+
+if flat4pm
+    strategy.close_all(comment="Flat 4pm NY", alert_message=MSG_FLAT_4PM)
+    if enableAlerts
+        alert(MSG_FLAT_4PM, alert.freq_once_per_bar_close)
+
+alertcondition(flat4pm, title="Daily Flat 4pm NY", message=MSG_FLAT_4PM)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VISUAL ELEMENTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Plot OR levels and indicators
+plot(orHigh, "OR High", color=color.gray, linewidth=1)
+plot(orLow, "OR Low", color=color.gray, linewidth=1)
+plot(orMid, "OR Mid", color=color.silver, linewidth=1)
+plot(useVWAP ? vwap : na, "VWAP", color=color.yellow, linewidth=2)
+plot(useEMA ? ema : na, "EMA", color=color.blue, linewidth=2)
+plot(useHTFTrend ? htfEMA : na, "HTF EMA", color=color.purple, linewidth=2, style=plot.style_linebr)
+
+// Plot stop levels
+plot(haveOR ? slLong : na, "SL Long", color=color.new(color.red, 0), style=plot.style_linebr)
+plot(haveOR ? slShort : na, "SL Short", color=color.new(color.red, 0), style=plot.style_linebr)
+
+// Background for closed trading windows
+bgcolor(useTimeFilter and not inWindow ? color.new(color.red, 85) : na)
+
+// TP/SL exit labels
+tradeJustClosed = strategy.closedtrades > 0 and strategy.closedtrades != strategy.closedtrades[1]
+
+var bool showTP = false
+var bool showSL = false
+
+if tradeJustClosed
+    lastTradeIndex = strategy.closedtrades - 1
+    exitPrice = strategy.closedtrades.exit_price(lastTradeIndex)
+    entryPrice = strategy.closedtrades.entry_price(lastTradeIndex)
+    wasLong = strategy.closedtrades.entry_id(lastTradeIndex) == "Long"
+    
+    hitTP = wasLong ? (exitPrice > entryPrice) : (exitPrice < entryPrice)
+    
+    showTP := hitTP
+    showSL := not hitTP
+else
+    showTP := false
+    showSL := false
+
+plotshape(showTP, "TP", style=shape.labelup, location=location.belowbar,
+          color=color.new(color.green, 0), text="TP", textcolor=color.white, size=size.tiny)
+plotshape(showSL, "SL", style=shape.labeldown, location=location.abovebar,
+          color=color.new(color.red, 0), text="SL", textcolor=color.white, size=size.tiny)
