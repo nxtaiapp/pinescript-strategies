@@ -1,0 +1,261 @@
+//@version=5
+strategy("Mean Reversion",
+     overlay=true, initial_capital=50000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     calc_on_every_tick=false,
+     calc_on_order_fills=true, process_orders_on_close=false)
+
+// ========================================
+// USER INPUTS
+// ========================================
+// Moving Average & Standard Deviation Settings
+maLength = input.int(21, "MA Length")
+stdDevMultiplier = input.float(2.0, "Standard Deviation Multiplier", step=0.1)
+
+// RSI Settings
+rsiLength = input.int(5, "RSI Length")
+rsiOversold = input.int(20, "RSI Oversold Level")
+rsiOverbought = input.int(80, "RSI Overbought Level")
+
+// Trade Management (in ticks)
+profitTicks = input.int(21, "Profit Target (ticks)")
+stopTicks = input.int(34, "Stop Loss (ticks)")
+tickValue = input.float(12.50, "Tick Value ($)", tooltip="ES = $12.50, NQ = $5.00")
+
+// Position Sizing
+initialContracts = input.int(10, "Initial Contracts")
+maxContracts = input.int(10, "Maximum Contracts")
+
+// Time Filter
+useTimeFilter = input.bool(true, "Use Trading Hours Filter")
+startHour = input.int(8, "Start Hour (EST)")
+startMinute = input.int(30, "Start Minute")
+endHour = input.int(14, "End Hour (EST)")
+endMinute = input.int(0, "End Minute")
+
+// Daily Limits
+useDailyLimits = input.bool(true, "Use Daily P&L Limits")
+dailyProfitTarget = input.float(999, "Daily Profit Target ($)")
+dailyLossLimit = input.float(500, "Daily Loss Limit ($)")
+maxDailyTrades = input.int(2, "Max Daily Trades")
+
+// ========================================
+// CALCULATE INDICATORS
+// ========================================
+// Bollinger Bands (for standard deviation)
+basis = ta.sma(close, maLength)
+stdDev = ta.stdev(close, maLength)
+upperBand = basis + (stdDevMultiplier * stdDev)
+lowerBand = basis - (stdDevMultiplier * stdDev)
+
+// RSI
+rsi = ta.rsi(close, rsiLength)
+
+// === MACD (added) ===
+// MACD Inputs
+macd_fast_length = input.int(8, "MACD Fast Length")
+macd_slow_length = input.int(21, "MACD Slow Length")
+macd_signal_length = input.int(8, "MACD Signal Length")
+macd_src = input.source(close, "MACD Source")
+
+sma_source_macd = input.string("EMA", "MACD Oscillator MA Type", options=["SMA", "EMA"])
+sma_signal_macd = input.string("EMA", "MACD Signal MA Type", options=["SMA", "EMA"])
+// MACD confirmation mode (expanded)
+macdConfirm = input.string("None", "MACD Confirmation", options=["None", "Histogram > 0", "Histogram Rising", "MACD > Signal", "MACD Cross Signal"], tooltip="Choose how MACD must confirm entries")
+requireRSIandMACD = input.bool(true, "Require RSI oversold/overbought AND MACD rising/falling", tooltip="If true, longs require RSI oversold AND MACD histogram rising; shorts require RSI overbought AND MACD histogram falling")
+
+// Price action confirmation
+requirePriceAction = input.bool(false, "Require Price Action Confirmation", tooltip="Require a small engulfing or wick rejection before entry")
+priceActionType = input.string("Lower Wick", "Price Action Type", options=["Engulfing", "Lower Wick"], tooltip="Type of price-action confirmation to require")
+wickFactor = input.float(1.5, "Wick Factor (lower/upper wick vs body)", step=0.1)
+
+fast_ma = sma_source_macd == "SMA" ? ta.sma(macd_src, macd_fast_length) : ta.ema(macd_src, macd_fast_length)
+slow_ma = sma_source_macd == "SMA" ? ta.sma(macd_src, macd_slow_length) : ta.ema(macd_src, macd_slow_length)
+macd = fast_ma - slow_ma
+signal = sma_signal_macd == "SMA" ? ta.sma(macd, macd_signal_length) : ta.ema(macd, macd_signal_length)
+hist = macd - signal
+
+// Price-action helper functions
+isBullishEngulfing() =>
+    close > open and close[1] < open[1] and open < close[1] and close > open[1]
+
+isBearishEngulfing() =>
+    close < open and close[1] > open[1] and open > close[1] and close < open[1]
+
+isLowerWickRejection() =>
+    // bullish candle with lower wick significantly larger than body
+    close > open and (math.min(open, close) - low) > (math.abs(close - open) * wickFactor)
+
+isUpperWickRejection() =>
+    // bearish candle with upper wick significantly larger than body
+    close < open and (high - math.max(open, close)) > (math.abs(close - open) * wickFactor)
+
+// ========================================
+// TRADING SESSION FILTER
+// ========================================
+isInSession() =>
+    if useTimeFilter
+        sessionTime = hour * 60 + minute
+        startTime = startHour * 60 + startMinute
+        endTime = endHour * 60 + endMinute
+        sessionTime >= startTime and sessionTime <= endTime
+    else
+        true
+
+// ========================================
+// DAILY TRADE TRACKING
+// ========================================
+var float dailyPnL = 0.0
+var int dailyTradeCount = 0
+var int lastTradeDay = 0
+var int lastClosedTrades = 0
+
+// Reset daily counters
+currentDay = dayofmonth
+if currentDay != lastTradeDay
+    dailyPnL := 0.0
+    dailyTradeCount := 0
+    lastTradeDay := currentDay
+    lastClosedTrades := strategy.closedtrades
+
+// Check if we can trade based on daily limits
+canTradeToday() =>
+    if useDailyLimits
+        withinProfitLimit = dailyPnL < dailyProfitTarget
+        withinLossLimit = dailyPnL > -dailyLossLimit
+        withinTradeLimit = dailyTradeCount < maxDailyTrades
+        withinProfitLimit and withinLossLimit and withinTradeLimit
+    else
+        true
+
+// ========================================
+// ENTRY CONDITIONS
+// ========================================
+// Long Entry: Price touches lower band AND RSI oversold
+// Apply MACD filter logic
+// MACD confirmation logic
+macdLongOk = false
+macdShortOk = false
+if macdConfirm == "None"
+    macdLongOk := true
+    macdShortOk := true
+else
+    macdLongOk := macdConfirm == "Histogram > 0" and hist > 0 or macdConfirm == "Histogram Rising" and hist > hist[1] or macdConfirm == "MACD > Signal" and macd > signal or macdConfirm == "MACD Cross Signal" and ta.crossover(macd, signal)
+    macdShortOk := macdConfirm == "Histogram > 0" and hist < 0 or macdConfirm == "Histogram Rising" and hist < hist[1] or macdConfirm == "MACD > Signal" and macd < signal or macdConfirm == "MACD Cross Signal" and ta.crossunder(macd, signal)
+
+// price-action confirmation
+paLongOk = true
+paShortOk = true
+if requirePriceAction
+    paLongOk := (priceActionType == "Engulfing" and isBullishEngulfing()) or (priceActionType == "Lower Wick" and isLowerWickRejection())
+    paShortOk := (priceActionType == "Engulfing" and isBearishEngulfing()) or (priceActionType == "Lower Wick" and isUpperWickRejection())
+
+// combine RSI+MACD rising requirement if enabled
+macdRiseOkLong = true
+macdRiseOkShort = true
+if requireRSIandMACD
+    macdRiseOkLong := hist > hist[1]
+    macdRiseOkShort := hist < hist[1]
+
+longCondition = close <= lowerBand and rsi < rsiOversold and isInSession() and canTradeToday() and macdLongOk and paLongOk and macdRiseOkLong
+
+// Short Entry: Price touches upper band AND RSI overbought
+shortCondition = close >= upperBand and rsi > rsiOverbought and isInSession() and canTradeToday() and macdShortOk and paShortOk and macdRiseOkShort
+
+// ========================================
+// POSITION SIZING LOGIC
+// ========================================
+currentPosition = strategy.position_size
+canAddPosition = math.abs(currentPosition) < maxContracts
+
+// Determine contract size for new entry
+getContractSize() =>
+    if math.abs(currentPosition) == 0
+        initialContracts
+    else if canAddPosition
+        1
+    else
+        0
+
+contractSize = getContractSize()
+
+// ========================================
+// EXECUTE TRADES
+// ========================================
+// Calculate tick-based stops and targets
+tickSize = syminfo.mintick
+profitDistance = profitTicks * tickSize
+stopDistance = stopTicks * tickSize
+
+// Long Trades
+if longCondition and (currentPosition >= 0) and canAddPosition
+    entryPrice = close
+    stopPrice = entryPrice - stopDistance
+    targetPrice = entryPrice + profitDistance
+    
+    entryID = "Long" + str.tostring(math.abs(currentPosition) + 1)
+    
+    strategy.entry(entryID, strategy.long, qty=contractSize)
+    strategy.exit(entryID + "_Exit", entryID, limit=targetPrice, stop=stopPrice, comment="TP/SL")
+    
+    if math.abs(currentPosition) == 0
+        dailyTradeCount += 1
+
+// Short Trades
+if shortCondition and (currentPosition <= 0) and canAddPosition
+    entryPrice = close
+    stopPrice = entryPrice + stopDistance
+    targetPrice = entryPrice - profitDistance
+    
+    entryID = "Short" + str.tostring(math.abs(currentPosition) + 1)
+    
+    strategy.entry(entryID, strategy.short, qty=contractSize)
+    strategy.exit(entryID + "_Exit", entryID, limit=targetPrice, stop=stopPrice, comment="TP/SL")
+    
+    if math.abs(currentPosition) == 0
+        dailyTradeCount += 1
+
+// ========================================
+// TRACK P&L
+// ========================================
+if strategy.closedtrades > lastClosedTrades
+    newClosedTrades = strategy.closedtrades - lastClosedTrades
+    
+    for i = 0 to newClosedTrades - 1
+        tradeIndex = strategy.closedtrades - 1 - i
+        tradePnL = strategy.closedtrades.profit(tradeIndex)
+        tradePnLDollars = tradePnL * tickValue / tickSize
+        dailyPnL += tradePnLDollars
+    
+    lastClosedTrades := strategy.closedtrades
+
+// ========================================
+// PLOTTING
+// ========================================
+// Plot Bollinger Bands
+plot(basis, "MA", color=color.blue, linewidth=2)
+p1 = plot(upperBand, "Upper Band", color=color.red, linewidth=1)
+p2 = plot(lowerBand, "Lower Band", color=color.green, linewidth=1)
+fill(p1, p2, color=color.rgb(33, 150, 243, 95))
+
+// Plot Entry Signals
+plotshape(longCondition and canAddPosition, "Long Signal", shape.triangleup, location.belowbar, color=color.green, size=size.small)
+plotshape(shortCondition and canAddPosition, "Short Signal", shape.triangledown, location.abovebar, color=color.red, size=size.small)
+
+// Background color for RSI conditions
+bgcolor(rsi < rsiOversold ? color.new(color.green, 90) : na, title="Oversold")
+bgcolor(rsi > rsiOverbought ? color.new(color.red, 90) : na, title="Overbought")
+
+// === MACD PLOTTING ===
+hline(0, "MACD Zero", color=color.new(color.gray, 80))
+plot(hist, title = "MACD Histogram", style=plot.style_columns, color = hist >= 0 ? color.new(color.green, 0) : color.new(color.red, 0))
+plot(macd, title = "MACD", color = color.blue)
+plot(signal, title = "MACD Signal", color = color.orange)
+
+// ========================================
+// ALERTS
+// ========================================
+alertcondition(longCondition and canAddPosition, "Long Entry Signal", "Mean Reversion: Long signal triggered")
+alertcondition(shortCondition and canAddPosition, "Short Entry Signal", "Mean Reversion: Short signal triggered")
+alertcondition(dailyPnL >= dailyProfitTarget and useDailyLimits, "Daily Profit Target Hit", "Daily profit target reached!")
+alertcondition(dailyPnL <= -dailyLossLimit and useDailyLimits, "Daily Loss Limit Hit", "Daily loss limit reached!")

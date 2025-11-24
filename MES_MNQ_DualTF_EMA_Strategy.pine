@@ -1,0 +1,314 @@
+//@version=5
+strategy("EMA Trend Surfer", 
+         overlay=true, 
+         initial_capital=50000,
+         default_qty_type=strategy.fixed,
+         default_qty_value=4,
+         commission_type=strategy.commission.cash_per_contract,
+         commission_value=0.34,
+         slippage=2,
+         process_orders_on_close=true,
+         calc_on_every_tick=false)
+
+// ═══════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════
+
+// Symbol Selection
+symbolType = input.string("AUTO", "Symbol Type", options=["AUTO", "MES", "MNQ"], 
+                          tooltip="AUTO will detect based on current symbol")
+
+// EMA Settings
+ema1_length = input.int(8, "Fast EMA Length", minval=1)
+ema2_length = input.int(21, "Slow EMA Length", minval=1)
+
+// Timeframes
+htf_timeframe = input.timeframe("15", "Higher Timeframe (HTF)", tooltip="Used for trend direction")
+ltf_timeframe = input.timeframe("1", "Lower Timeframe (LTF)", tooltip="Used for entries (should match chart)")
+
+// Trading Session
+useSession = input.bool(true, "Use NY Session Only")
+sessionTime = input.session("0930-1600", "Trading Session (ET)", tooltip="Regular NY session 9:30 AM - 4:00 PM ET")
+
+// Position Management
+partial_exit_pct = input.float(50, "Partial Exit %", minval=1, maxval=100, step=1) / 100
+
+// Daily loss limit
+enable_daily_limit = input.bool(true, "Enable Daily Loss Limit")
+max_daily_losses = input.int(3, "Max Daily Losses", minval=0)
+
+// -- Filters to reduce over-trading when EMAs are flat/close
+enable_ema_spread_filter = input.bool(true, "Enable EMA spread filter (ATR)")
+min_ema_spread_atr = input.float(0.5, "Min EMA spread (ATR multiples)", step=0.1)
+atr_length = input.int(14, "ATR Length")
+
+enable_adx_filter = input.bool(false, "Enable ADX filter")
+adx_length = input.int(14, "ADX Length")
+min_adx = input.int(20, "Min ADX", minval=0)
+
+// Display Options
+showHTFEMAs = input.bool(true, "Show HTF EMAs on Chart")
+showLabels = input.bool(true, "Show Entry/Exit Labels")
+showStats = input.bool(true, "Show Statistics Table")
+
+// ═══════════════════════════════════════════════════════════════════
+// SYMBOL DETECTION AND TICK VALUES
+// ═══════════════════════════════════════════════════════════════════
+
+// Auto-detect symbol type
+detectedSymbol = symbolType == "AUTO" ? 
+                 (str.contains(syminfo.ticker, "MES") ? "MES" : 
+                  str.contains(syminfo.ticker, "MNQ") ? "MNQ" : "MES") : 
+                 symbolType
+
+// Set tick value based on symbol
+tickValue = detectedSymbol == "MES" ? 1.25 : 0.50  // MES = $1.25, MNQ = $0.50 per tick
+
+// ═══════════════════════════════════════════════════════════════════
+// SESSION FILTER
+// ═══════════════════════════════════════════════════════════════════
+
+// Check if we're in the trading session
+inSession = not useSession or time(timeframe.period, sessionTime + ":1234567")
+
+// -- Daily loss tracking
+var int daily_losses = 0
+var int prev_losstrades = strategy.losstrades
+var int prev_day = dayofmonth(time)
+
+// reset daily counter at midnight (new day)
+curr_day = dayofmonth(time)
+if curr_day != prev_day
+    daily_losses := 0
+    prev_day := curr_day
+
+// detect newly closed losing trades and increment daily_losses
+if strategy.losstrades > prev_losstrades
+    lost_inc = strategy.losstrades - prev_losstrades
+    daily_losses := daily_losses + lost_inc
+    prev_losstrades := strategy.losstrades
+
+// ═══════════════════════════════════════════════════════════════════
+// CALCULATE EMAS
+// ═══════════════════════════════════════════════════════════════════
+
+// Current timeframe (LTF) EMAs
+ltf_ema1 = ta.ema(close, ema1_length)
+ltf_ema2 = ta.ema(close, ema2_length)
+
+// Higher timeframe (HTF) EMAs
+htf_ema1 = request.security(syminfo.tickerid, htf_timeframe, ta.ema(close, ema1_length))
+htf_ema2 = request.security(syminfo.tickerid, htf_timeframe, ta.ema(close, ema2_length))
+htf_close = request.security(syminfo.tickerid, htf_timeframe, close)
+
+// ═══════════════════════════════════════════════════════════════════
+// TREND DETECTION
+// ═══════════════════════════════════════════════════════════════════
+
+// HTF Trend (15-min)
+htf_bullish = htf_ema1 > htf_ema2 and htf_close > htf_ema1
+htf_bearish = htf_ema1 < htf_ema2 and htf_close < htf_ema1
+
+// LTF Trend (1-min) - EMAs must be aligned with HTF
+ltf_bullish_aligned = ltf_ema1 > ltf_ema2
+ltf_bearish_aligned = ltf_ema1 < ltf_ema2
+
+// ==== Volatility / trend filters ====
+atr = ta.atr(atr_length)
+ema_spread = math.abs(ltf_ema1 - ltf_ema2)
+ema_spread_ok = ema_spread > atr * min_ema_spread_atr
+
+adx_val = ta.adx(adx_length)
+adx_ok = adx_val >= min_adx
+
+// ═══════════════════════════════════════════════════════════════════
+// ENTRY CONDITIONS
+// ═══════════════════════════════════════════════════════════════════
+
+// Long Entry: Price closes below 8 EMA then closes back above it
+// Must have: HTF bullish, LTF aligned, in session
+dipped_below_ema1 = close[1] < ltf_ema1[1]
+closed_above_ema1 = close > ltf_ema1
+
+long_entry = htf_bullish and ltf_bullish_aligned and dipped_below_ema1 and closed_above_ema1 and inSession and strategy.position_size == 0 and (not enable_daily_limit or daily_losses < max_daily_losses) and (not enable_ema_spread_filter or ema_spread_ok) and (not enable_adx_filter or adx_ok)
+
+// Short Entry: Price closes above 8 EMA then closes back below it (inverse)
+peaked_above_ema1 = close[1] > ltf_ema1[1]
+closed_below_ema1 = close < ltf_ema1
+
+short_entry = htf_bearish and ltf_bearish_aligned and peaked_above_ema1 and closed_below_ema1 and inSession and strategy.position_size == 0 and (not enable_daily_limit or daily_losses < max_daily_losses) and (not enable_ema_spread_filter or ema_spread_ok) and (not enable_adx_filter or adx_ok)
+
+// ═══════════════════════════════════════════════════════════════════
+// EXIT CONDITIONS
+// ═══════════════════════════════════════════════════════════════════
+
+// Long Exits
+long_partial_exit = strategy.position_size > 0 and close < ltf_ema1
+long_full_exit = strategy.position_size > 0 and close < ltf_ema2
+
+// Short Exits
+short_partial_exit = strategy.position_size < 0 and close > ltf_ema1
+short_full_exit = strategy.position_size < 0 and close > ltf_ema2
+
+// ═══════════════════════════════════════════════════════════════════
+// POSITION TRACKING
+// ═══════════════════════════════════════════════════════════════════
+
+var float entry_price = 0.0
+var bool partial_exit_done = false
+var int contracts_remaining = 0
+
+// ═══════════════════════════════════════════════════════════════════
+// EXECUTE TRADES
+// ═══════════════════════════════════════════════════════════════════
+
+// LONG TRADES
+if long_entry
+    strategy.entry("Long", strategy.long, qty=4, comment="Long Entry")
+    entry_price := close
+    partial_exit_done := false
+    contracts_remaining := 4
+    if showLabels
+        label.new(bar_index, low, "L", color=color.green, style=label.style_label_up, textcolor=color.white, size=size.small)
+
+// Long Partial Exit (50%)
+if long_partial_exit and not partial_exit_done and contracts_remaining > 2
+    exit_qty = math.floor(4 * partial_exit_pct)
+    strategy.close("Long", qty=exit_qty, comment="Partial Exit 50%")
+    partial_exit_done := true
+    contracts_remaining := contracts_remaining - exit_qty
+    if showLabels
+        label.new(bar_index, high, "P50%", color=color.orange, style=label.style_label_down, textcolor=color.white, size=size.small)
+
+// Long Full Exit
+if long_full_exit
+    strategy.close("Long", comment="Full Exit")
+    partial_exit_done := false
+    contracts_remaining := 0
+    if showLabels
+        label.new(bar_index, high, "X", color=color.red, style=label.style_label_down, 
+                 textcolor=color.white, size=size.small)
+
+// SHORT TRADES
+if short_entry
+    strategy.entry("Short", strategy.short, qty=4, comment="Short Entry")
+    entry_price := close
+    partial_exit_done := false
+    contracts_remaining := 4
+    if showLabels
+        label.new(bar_index, high, "S", color=color.red, style=label.style_label_down, 
+                 textcolor=color.white, size=size.small)
+
+// Short Partial Exit (50%)
+if short_partial_exit and not partial_exit_done and contracts_remaining > 2
+    exit_qty = math.floor(4 * partial_exit_pct)
+    strategy.close("Short", qty=exit_qty, comment="Partial Exit 50%")
+    partial_exit_done := true
+    contracts_remaining := contracts_remaining - exit_qty
+    if showLabels
+        label.new(bar_index, low, "P50%", color=color.orange, style=label.style_label_up, 
+                 textcolor=color.white, size=size.small)
+
+// Short Full Exit
+if short_full_exit
+    strategy.close("Short", comment="Full Exit")
+    partial_exit_done := false
+    contracts_remaining := 0
+    if showLabels
+        label.new(bar_index, low, "X", color=color.green, style=label.style_label_up, 
+                 textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════
+// PLOTTING
+// ═══════════════════════════════════════════════════════════════════
+
+// Plot LTF EMAs (always shown as they're on current timeframe)
+plot(ltf_ema1, color=color.new(color.teal, 0), linewidth=2, title="LTF 8 EMA")
+plot(ltf_ema2, color=color.new(color.red, 0), linewidth=2, title="LTF 21 EMA")
+
+// Plot HTF EMAs (optional)
+plot(showHTFEMAs ? htf_ema1 : na, color=color.new(color.teal, 50), linewidth=3, 
+     title="HTF 8 EMA", style=plot.style_line)
+plot(showHTFEMAs ? htf_ema2 : na, color=color.new(color.red, 50), linewidth=3, 
+     title="HTF 21 EMA", style=plot.style_line)
+
+// Background color for trend
+bg_col = htf_bullish ? color.new(color.green, 95) : 
+         htf_bearish ? color.new(color.red, 95) : na
+bgcolor(bg_col, title="HTF Trend Background")
+
+// Session background
+bgcolor(inSession ? na : color.new(color.gray, 90), title="Outside Session")
+
+// ═══════════════════════════════════════════════════════════════════
+// STATISTICS TABLE
+// ═══════════════════════════════════════════════════════════════════
+
+if showStats and barstate.islastconfirmedhistory
+    var table statsTable = table.new(position.top_right, 2, 9, 
+                                     bgcolor=color.new(color.black, 80),
+                                     frame_color=color.gray, frame_width=1,
+                                     border_color=color.gray, border_width=1)
+    
+    // Header
+    table.cell(statsTable, 0, 0, "Metric", bgcolor=color.new(color.blue, 50), 
+              text_color=color.white, text_halign=text.align_center)
+    table.cell(statsTable, 1, 0, "Value", bgcolor=color.new(color.blue, 50), 
+              text_color=color.white, text_halign=text.align_center)
+    
+    // Symbol Info
+    table.cell(statsTable, 0, 1, "Symbol", text_color=color.white)
+    table.cell(statsTable, 1, 1, detectedSymbol + " ($" + str.tostring(tickValue) + "/tick)", 
+              text_color=color.white)
+    
+    // Current Trend
+    trend_text = htf_bullish ? "BULLISH ↑" : htf_bearish ? "BEARISH ↓" : "NEUTRAL —"
+    trend_color = htf_bullish ? color.green : htf_bearish ? color.red : color.gray
+    table.cell(statsTable, 0, 2, "HTF Trend", text_color=color.white)
+    table.cell(statsTable, 1, 2, trend_text, text_color=trend_color)
+    
+    // Position
+    pos_text = strategy.position_size > 0 ? "LONG " + str.tostring(math.abs(strategy.position_size)) :
+               strategy.position_size < 0 ? "SHORT " + str.tostring(math.abs(strategy.position_size)) :
+               "FLAT"
+    pos_color = strategy.position_size > 0 ? color.green : (strategy.position_size < 0 ? color.red : color.gray)
+    table.cell(statsTable, 0, 3, "Position", text_color=color.white)
+    table.cell(statsTable, 1, 3, pos_text, text_color=pos_color)
+    
+    // Total Trades
+    table.cell(statsTable, 0, 4, "Total Trades", text_color=color.white)
+    table.cell(statsTable, 1, 4, str.tostring(strategy.closedtrades), text_color=color.white)
+    
+    // Win Rate
+    wins = strategy.wintrades
+    losses = strategy.losstrades
+    winrate = strategy.closedtrades > 0 ? (wins / strategy.closedtrades) * 100 : 0
+    table.cell(statsTable, 0, 5, "Win Rate", text_color=color.white)
+    table.cell(statsTable, 1, 5, str.tostring(winrate, "##.#") + "%", 
+              text_color=winrate >= 50 ? color.green : color.red)
+    
+    // Net Profit
+    table.cell(statsTable, 0, 6, "Net Profit", text_color=color.white)
+    table.cell(statsTable, 1, 6, "$" + str.tostring(strategy.netprofit, "##,###.##"), 
+              text_color=strategy.netprofit >= 0 ? color.green : color.red)
+    
+    // Session Time
+    session_active = inSession ? "✓ ACTIVE" : "✗ CLOSED"
+    session_color = inSession ? color.green : color.gray
+    table.cell(statsTable, 0, 7, "Session", text_color=color.white)
+    table.cell(statsTable, 1, 7, session_active, text_color=session_color)
+    
+    // Losses Today
+    table.cell(statsTable, 0, 8, "Losses Today", text_color=color.white)
+    table.cell(statsTable, 1, 8, str.tostring(daily_losses), text_color=daily_losses >= max_daily_losses ? color.red : color.white)
+
+// ═══════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════
+
+alertcondition(long_entry, title="Long Entry", message="Long Entry Signal: {{ticker}}")
+alertcondition(short_entry, title="Short Entry", message="Short Entry Signal: {{ticker}}")
+alertcondition(long_partial_exit, title="Long Partial Exit", message="Long 50% Exit: {{ticker}}")
+alertcondition(short_partial_exit, title="Short Partial Exit", message="Short 50% Exit: {{ticker}}")
+alertcondition(long_full_exit, title="Long Full Exit", message="Long Full Exit: {{ticker}}")
+alertcondition(short_full_exit, title="Short Full Exit", message="Short Full Exit: {{ticker}}")
