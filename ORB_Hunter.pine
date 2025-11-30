@@ -1,5 +1,5 @@
 //@version=5
-strategy("ORB Pro",
+strategy("ORB Hunter",
      overlay=true, initial_capital=50000,
      default_qty_type=strategy.fixed, default_qty_value=1,
      calc_on_every_tick=false,
@@ -21,6 +21,7 @@ MSG_RUNNER_SL    = "Runner SL filled " + ALERT_ID
 MSG_FULL_TP      = "FULL TP filled " + ALERT_ID
 MSG_FULL_SL      = "FULL SL filled " + ALERT_ID
 MSG_VWAP_EXIT    = "EXIT: VWAP invalidation " + ALERT_ID
+MSG_HTF_EMA_EXIT = "EXIT: HTF EMA invalidation " + ALERT_ID
 MSG_BREAKEVEN    = "BREAKEVEN TRIGGERED " + ALERT_ID
 MSG_FLAT_4PM     = "Exit all positions at or after 4:00pm New York time"
 
@@ -51,6 +52,8 @@ useHTFTrend      = input.bool(true, "Enable HTF Trend Filter", group="HTF Trend 
 htfTimeframe     = input.timeframe("30", "HTF Timeframe", group="HTF Trend Filter")
 htfEmaLen        = input.int(100, "HTF EMA Length", minval=1, group="HTF Trend Filter")
 requireHTFClosed = input.bool(true, "Only trade when HTF bar is CLOSED", group="HTF Trend Filter")
+useHTFEmaExit    = input.bool(true, "Exit on HTF EMA Invalidation", group="HTF Trend Filter",
+                   tooltip="Close position when price closes below HTF EMA (long) or above HTF EMA (short)")
 
 // ATR / Volatility Filters
 useATRFilter     = input.bool(true, "Enable Min OR vs ATR", group="ATR / Volatility Filters")
@@ -150,8 +153,8 @@ inWindow = (not useTimeFilter) or inAM or inPM
 
 // Backtest effective start/end (ms). If `backtestAuto` is true, default to last `backtestDays` days.
 msPerDay = 24 * 60 * 60 * 1000
-endEffective = backtestAuto ? time : backtestEnd
-startEffective = backtestAuto ? time - backtestDays * msPerDay : backtestStart
+endEffective = backtestAuto ? timenow : backtestEnd
+startEffective = backtestAuto ? timenow - backtestDays * msPerDay : backtestStart
 inBacktestRange = time >= startEffective and time <= endEffective
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -398,6 +401,22 @@ if shortInvalidVWAP
         alert(MSG_VWAP_EXIT, alert.freq_once_per_bar_close)
 
 alertcondition(longInvalidVWAP or shortInvalidVWAP, title="VWAP Invalidate", message=MSG_VWAP_EXIT)
+
+// HTF EMA invalidation
+longInvalidHTF  = useHTFEmaExit and strategy.position_size > 0 and close < htfEMA
+shortInvalidHTF = useHTFEmaExit and strategy.position_size < 0 and close > htfEMA
+
+if longInvalidHTF
+    strategy.close("Long", comment="HTF EMA Invalidate", alert_message=MSG_HTF_EMA_EXIT)
+    if enableAlerts
+        alert(MSG_HTF_EMA_EXIT, alert.freq_once_per_bar_close)
+
+if shortInvalidHTF
+    strategy.close("Short", comment="HTF EMA Invalidate", alert_message=MSG_HTF_EMA_EXIT)
+    if enableAlerts
+        alert(MSG_HTF_EMA_EXIT, alert.freq_once_per_bar_close)
+
+alertcondition(longInvalidHTF or shortInvalidHTF, title="HTF EMA Invalidate", message=MSG_HTF_EMA_EXIT)
 
 // Daily 4pm flat
 after4pmNY = not na(time(timeframe.period, "1600-2359", "America/New_York"))
